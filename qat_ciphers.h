@@ -169,6 +169,7 @@ CpaStatus qat_sym_perform_op(int inst_num,
                              CpaBoolean * pVerifyResult);
 
 const EVP_CIPHER *qat_create_cipher_meth(int nid, int keylen);
+const EVP_CIPHER *qat_create_ipsec_cipher_meth(int nid, int keylen);
 # ifndef OPENSSL_ENABLE_QAT_SMALL_PACKET_CIPHER_OFFLOADS
 int qat_pkt_threshold_table_set_threshold(const char *cipher_name,
                                           int threshold);

@@ -46,6 +46,7 @@ if OPENSSL_QAT_OFFLOAD
                    qat_dsa.c         \
                    qat_ec.c          \
                    qat_prf.c         \
+                   qat_ipsec_aes.c   \
                    qat_gcm.c
 
 if !QAT_OPENSSL_110

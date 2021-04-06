@@ -73,6 +73,7 @@ typedef struct _chained_info {
 } chained_info;
 
 static chained_info info[] = {
+    {NID_aes_128_cbc, NULL, AES_KEY_SIZE_128},
 #ifdef OPENSSL_QAT_OFFLOAD
     {NID_aes_128_cbc_hmac_sha1, NULL, AES_KEY_SIZE_128},
     {NID_aes_128_cbc_hmac_sha256, NULL, AES_KEY_SIZE_128},
@@ -94,6 +95,7 @@ static const unsigned int num_cc = sizeof(info) / sizeof(chained_info);
 
 /* Qat Symmetric cipher function register */
 int qat_cipher_nids[] = {
+    NID_aes_128_cbc,
 #ifdef OPENSSL_QAT_OFFLOAD
     NID_aes_128_cbc_hmac_sha1,
     NID_aes_128_cbc_hmac_sha256,
@@ -215,6 +217,9 @@ void qat_create_ciphers(void)
                     info[i].cipher = (EVP_CIPHER *)
                         qat_create_gcm_cipher_meth(info[i].nid, info[i].keylen);
 # endif
+                } else if (info[i].nid == NID_aes_128_cbc) {
+                    info[i].cipher = (EVP_CIPHER *)
+                        qat_create_ipsec_cipher_meth(info[i].nid, info[i].keylen);
                 } else {
                     info[i].cipher = (EVP_CIPHER *)
                         qat_create_cipher_meth(info[i].nid, info[i].keylen);
