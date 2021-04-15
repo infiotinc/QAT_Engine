@@ -722,6 +722,10 @@ int qat_chained_ipsec_ciphers_ctrl(EVP_CIPHER_CTX *ctx, int type, int arg, void 
 
     switch (type) {
         case EVP_CTRL_AEAD_SET_MAC_KEY:
+            if (!INIT_SEQ_IS_FLAG_SET(qctx, INIT_SEQ_QAT_CTX_INIT)) {
+                WARN("QAT Context not initialised");
+                return -1;
+            }
             hmac_key = qctx->hmac_key;
             ssd = qctx->session_data;
 
@@ -915,6 +919,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
     int pipe = 0;
     int error = 0;
     int outlen = -1;
+    void *app_data = NULL;
     thread_local_variables_t *tlv = NULL;
 
     if (ctx == NULL) {
@@ -1047,7 +1052,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
             goto cleanup;
         }
 #endif
-	/* Add pad lne for HMAC */
+        /* Add pad lne for HMAC */
         if (enc) {
             /* Set the payload length equal to entire length
              * of buffer i.e. there is no space for HMAC in
@@ -1132,7 +1137,11 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
             error = 1;
             break;
         }
-        memcpy(opd->pIv, EVP_CIPHER_CTX_iv(ctx), ivlen);
+        if ((app_data = EVP_CIPHER_CTX_get_app_data(ctx)) != NULL) {
+           memcpy(opd->pIv, app_data, ivlen);
+        } else  {
+           memcpy(opd->pIv, EVP_CIPHER_CTX_iv(ctx), ivlen);
+        }
 
         /* Calculate payload and padding len */
         if (enc) {
@@ -1158,7 +1167,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         } else {
             opd->messageLenToCipherInBytes = len - IPSEC_QAT_ALIGNMENT - IPSEC_ICV_LENGTH;
             opd->messageLenToHashInBytes = len - IPSEC_ICV_LENGTH;
-	}
+        }
 
 
         FLATBUFF_ALLOC_AND_CHAIN(s_fbuf[1], d_fbuf[1], buflen);
@@ -1169,11 +1178,11 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         }
 
         memcpy(d_fbuf[1].pData, inb, buflen - discardlen);
-	if (enc) {
+        if (enc) {
             opd->pDigestResult = ((unsigned char*)d_fbuf[1].pData + len - IPSEC_QAT_ALIGNMENT);
-	} else {
+        } else {
             opd->pDigestResult = ((unsigned char*)d_fbuf[1].pData + len);
-	}
+        }
 
         DUMP_SYM_PERFORM_OP(qat_instance_handles[qctx->inst_num], opd, s_sgl, d_sgl);
 
