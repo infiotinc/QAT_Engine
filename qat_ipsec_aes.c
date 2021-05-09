@@ -107,6 +107,12 @@
                     (b2).dataLenInBytes = len; \
                 } while(0)
 
+#define FLATBUFF_CHAIN_LEN(b1, b2, len) \
+                do { \
+                    (b1).dataLenInBytes = len; \
+                    (b2).dataLenInBytes = len; \
+                } while(0)
+
 # define GET_SW_CIPHER(ctx) \
     qat_chained_cipher_sw_impl(EVP_CIPHER_CTX_nid((ctx)))
 
@@ -117,10 +123,58 @@
 #define DEBUG_PPL DEBUG
 #ifndef OPENSSL_DISABLE_QAT_CIPHERS
 
+#define INF_ASYNC_PKT_SIZE  1500
+
 #define IPSEC_ICV_LENGTH    12
 #define IPSEC_QAT_ALIGNMENT 24
 #define IPSEC_QAT_THRESHOLD 32
 
+#define INF_ASYNC_MODE_BH   1 << 0
+#define INF_ASYNC_MODE_CB   1 << 1
+
+#define CB_QOP_QUEUE_MAX    32
+#define CB_QOP_BURST_MAX    8
+
+typedef struct _inf_app_data {
+    u_int8_t    *iv;
+    void        *cb_arg;
+    int         (*cb_fn)(void*);
+    void        *thunk;
+} inf_app_data_t;
+
+typedef struct _inf_op_done {
+    /* Keep this as first member of the structure.
+     * to allow inter-changeability by casting pointers.
+     */
+    op_done_t       opDone;
+    volatile unsigned int num_pipes;
+    volatile unsigned int num_submitted;
+    volatile unsigned int num_processed;
+
+    EVP_CIPHER_CTX  *ctx;
+    int             ivlen;
+    int             enc;
+    int             mode;
+    int             qctx_out_len;
+    unsigned char   *qctx_out_src;
+    unsigned char   *qctx_out_dst;
+    unsigned char   *qctx_outb;
+    qat_op_params   *qop;
+    inf_app_data_t  app_data;
+} inf_op_done_t;
+
+typedef struct _inf_cb_stats {
+    unsigned int    queue_full;
+    unsigned int    queue_max;
+    unsigned int    pull_max;
+    unsigned int    submit_count;
+    unsigned int    retry_count;
+    unsigned int    callback_count;
+    unsigned int    callback_miss;
+    unsigned int    callback_err;
+} inf_cb_stats_t;
+
+inf_cb_stats_t g_inf_cb_stats = {0};
 
 static int qat_chained_ipsec_ciphers_init(EVP_CIPHER_CTX *ctx,
                                     const unsigned char *inkey,
@@ -131,6 +185,8 @@ static int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx,
                                          const unsigned char *in, size_t len);
 static int qat_chained_ipsec_ciphers_ctrl(EVP_CIPHER_CTX *ctx, int type, int arg,
                                     void *ptr);
+
+static int qat_chained_ipsec_bottom_half(inf_op_done_t *cb_op_done);
 
 #endif
 
@@ -281,13 +337,13 @@ const EVP_CIPHER *qat_create_ipsec_cipher_meth(int nid, int keylen)
 *   the paused job is woken up when all the pipelines have been proccessed.
 *
 ******************************************************************************/
-static void qat_chained_callbackFn(void *callbackTag, CpaStatus status,
+static void qat_chained_ipsec_callbackFn(void *callbackTag, CpaStatus status,
                                    const CpaCySymOp operationType,
                                    void *pOpData, CpaBufferList *pDstBuffer,
                                    CpaBoolean verifyResult)
 {
     ASYNC_JOB *job = NULL;
-    op_done_pipe_t *opdone = (op_done_pipe_t *)callbackTag;
+    inf_op_done_t *opdone = (inf_op_done_t *)callbackTag;
     CpaBoolean res = CPA_FALSE;
 
     if (opdone == NULL) {
@@ -313,8 +369,7 @@ static void qat_chained_callbackFn(void *callbackTag, CpaStatus status,
      * i.e. first in first out. If not all requests have been
      * submitted or processed, wait for more callbacks.
      */
-    if ((opdone->num_submitted != opdone->num_pipes) ||
-        (opdone->num_submitted != opdone->num_processed))
+    if ((opdone->num_submitted != opdone->num_processed))
         return;
 
     if (enable_heuristic_polling) {
@@ -330,9 +385,40 @@ static void qat_chained_callbackFn(void *callbackTag, CpaStatus status,
      * subsequently processed.
      */
     opdone->opDone.flag = 1;
+
     if (job) {
        qat_wake_job(job, ASYNC_STATUS_OK);
+    } else if (opdone-> mode & INF_ASYNC_MODE_CB) {
+        qat_chained_ipsec_bottom_half(opdone);
+        OPENSSL_free(opdone);
     }
+}
+
+static int qat_init_cb_op_done(inf_op_done_t *opd)
+{
+    opd->num_pipes = 0;
+    opd->num_submitted = 0;
+    opd->num_processed = 0;
+    opd->mode = INF_ASYNC_MODE_CB;
+
+    opd->opDone.flag = 0;
+    opd->opDone.verifyResult = CPA_TRUE;
+    opd->opDone.job = NULL;
+
+    return 1;
+}
+
+
+int qat_setup_cb_op_data(EVP_CIPHER_CTX *ctx, qat_op_params *qop)
+{
+    CpaCySymOpData *opd = NULL;
+    qat_chained_ctx *qctx = qat_chained_data(ctx);
+    opd = &qop->op_data;
+
+    /* Update Opdata */
+    opd->sessionCtx = qctx->session_ctx;
+
+    return 1;
 }
 
 /******************************************************************************
@@ -348,129 +434,73 @@ static void qat_chained_callbackFn(void *callbackTag, CpaStatus status,
 *    This function initialises the flatbuffer and flat buffer list for use.
 *
 ******************************************************************************/
-static int qat_setup_op_params(EVP_CIPHER_CTX *ctx)
+static int qat_setup_op_params(EVP_CIPHER_CTX *ctx, qat_op_params *qop)
 {
     CpaCySymOpData *opd = NULL;
-    Cpa32U msize = 0;
     qat_chained_ctx *qctx = qat_chained_data(ctx);
-    int i = 0;
-    unsigned int start;
+    Cpa32U msize = 0;
 
-    /* When no pipelines are used, numpipes = 1. The actual number of pipes are
-     * not known until the start of do_cipher.
-     */
-    if (PIPELINE_USED(qctx)) {
-        /* When Pipes have been previously used, the memory has been allocated
-         * for max supported pipes although initialised only for numpipes.
-         */
-        start = qctx->npipes_last_used;
-    } else {
-        start = 1;
-        /* When the context switches from using no pipes to using pipes,
-         * free the previous allocated memory.
-         */
-        if (qctx->qop != NULL && qctx->qop_len < qctx->numpipes) {
-            qat_chained_ipsec_ciphers_free_qop(&qctx->qop, &qctx->qop_len);
-            DEBUG_PPL("[%p] qop memory freed\n", ctx);
+    FLATBUFF_ALLOC_AND_CHAIN(qop->src_fbuf[0],
+                                qop->dst_fbuf[0], QAT_BYTE_ALIGNMENT);
+    if (qop->src_fbuf[0].pData == NULL) {
+        WARN("Unable to allocate memory for TLS header\n");
+        goto err;
+    }
+    memset(qop->src_fbuf[0].pData, 0, QAT_BYTE_ALIGNMENT);
+
+    qop->src_fbuf[1].pData = NULL;
+    qop->dst_fbuf[1].pData = NULL;
+
+    qop->src_sgl.numBuffers = 2;
+    qop->src_sgl.pBuffers = qop->src_fbuf;
+    qop->src_sgl.pUserData = NULL;
+    qop->src_sgl.pPrivateMetaData = NULL;
+
+    qop->dst_sgl.numBuffers = 2;
+    qop->dst_sgl.pBuffers = qop->dst_fbuf;
+    qop->dst_sgl.pUserData = NULL;
+    qop->dst_sgl.pPrivateMetaData = NULL;
+
+    /* setup meta data for buffer lists */
+    if (msize == 0 &&
+        cpaCyBufferListGetMetaSize(qat_instance_handles[qctx->inst_num],
+                                    qop->src_sgl.numBuffers,
+                                    &msize) != CPA_STATUS_SUCCESS) {
+        WARN("cpaCyBufferListGetBufferSize failed.\n");
+        goto err;
+    }
+
+    if (msize) {
+        qop->src_sgl.pPrivateMetaData =
+            qaeCryptoMemAlloc(msize, __FILE__, __LINE__);
+        qop->dst_sgl.pPrivateMetaData =
+            qaeCryptoMemAlloc(msize, __FILE__, __LINE__);
+        if (qop->src_sgl.pPrivateMetaData == NULL ||
+            qop->dst_sgl.pPrivateMetaData == NULL) {
+            WARN("QMEM alloc failed for PrivateData\n");
+            goto err;
         }
     }
 
-    /* Allocate memory for qop depending on whether pipes are used or not.
-     * In case of pipes, allocate for the maximum supported pipes.
-     */
-    if (qctx->qop == NULL) {
-        if (PIPELINE_USED(qctx)) {
-            WARN("Pipeline used but no data allocated. Possible memory leak\n");
-        }
+    FLATBUFF_ALLOC_AND_CHAIN(qop->src_fbuf[1], qop->dst_fbuf[1], INF_ASYNC_PKT_SIZE);
 
-        qctx->qop_len = qctx->numpipes > 1 ? QAT_MAX_PIPELINES : 1;
-        qctx->qop = (qat_op_params *) OPENSSL_zalloc(sizeof(qat_op_params)
-                                                     * qctx->qop_len);
-        if (qctx->qop == NULL) {
-            WARN("Unable to allocate memory[%lu bytes] for qat op params\n",
-                 sizeof(qat_op_params) * qctx->qop_len);
-            return 0;
-        }
-        /* start from 0 as New array of qat_op_params */
-        start = 0;
+    opd = &qop->op_data;
+
+   /* Copy the opData template */
+    memcpy(opd, &template_opData, sizeof(template_opData));
+
+    opd->pIv = qaeCryptoMemAlloc(EVP_CIPHER_CTX_iv_length(ctx),
+                                    __FILE__, __LINE__);
+    if (opd->pIv == NULL) {
+        WARN("QMEM Mem Alloc failed for pIv for Cb.\n");
+        return 0;
     }
 
-    for (i = start; i < qctx->numpipes; i++) {
-        /* This is a whole block the size of the memory alignment. If the
-         * alignment was to become smaller than the header size
-         * (TLS_VIRT_HEADER_SIZE) which is unlikely then we would need to add
-         * some more logic here to work out how many blocks of size
-         * QAT_BYTE_ALIGNMENT we need to allocate to fit the header in.
-         */
-        FLATBUFF_ALLOC_AND_CHAIN(qctx->qop[i].src_fbuf[0],
-                                 qctx->qop[i].dst_fbuf[0], QAT_BYTE_ALIGNMENT);
-        if (qctx->qop[i].src_fbuf[0].pData == NULL) {
-            WARN("Unable to allocate memory for TLS header\n");
-            goto err;
-        }
-        memset(qctx->qop[i].src_fbuf[0].pData, 0, QAT_BYTE_ALIGNMENT);
+    opd->ivLenInBytes = (Cpa32U) EVP_CIPHER_CTX_iv_length(ctx);
 
-        qctx->qop[i].src_fbuf[1].pData = NULL;
-        qctx->qop[i].dst_fbuf[1].pData = NULL;
-
-        qctx->qop[i].src_sgl.numBuffers = 2;
-        qctx->qop[i].src_sgl.pBuffers = qctx->qop[i].src_fbuf;
-        qctx->qop[i].src_sgl.pUserData = NULL;
-        qctx->qop[i].src_sgl.pPrivateMetaData = NULL;
-
-        qctx->qop[i].dst_sgl.numBuffers = 2;
-        qctx->qop[i].dst_sgl.pBuffers = qctx->qop[i].dst_fbuf;
-        qctx->qop[i].dst_sgl.pUserData = NULL;
-        qctx->qop[i].dst_sgl.pPrivateMetaData = NULL;
-
-        DEBUG("Pipe [%d] inst_num = %d\n", i, qctx->inst_num);
-        DEBUG("Pipe [%d] No of buffers = %d\n", i, qctx->qop[i].src_sgl.numBuffers);
-
-        /* setup meta data for buffer lists */
-        if (msize == 0 &&
-            cpaCyBufferListGetMetaSize(qat_instance_handles[qctx->inst_num],
-                                       qctx->qop[i].src_sgl.numBuffers,
-                                       &msize) != CPA_STATUS_SUCCESS) {
-            WARN("cpaCyBufferListGetBufferSize failed.\n");
-            goto err;
-        }
-
-        DEBUG("Pipe [%d] Size of meta data = %d\n", i, msize);
-
-        if (msize) {
-            qctx->qop[i].src_sgl.pPrivateMetaData =
-                qaeCryptoMemAlloc(msize, __FILE__, __LINE__);
-            qctx->qop[i].dst_sgl.pPrivateMetaData =
-                qaeCryptoMemAlloc(msize, __FILE__, __LINE__);
-            if (qctx->qop[i].src_sgl.pPrivateMetaData == NULL ||
-                qctx->qop[i].dst_sgl.pPrivateMetaData == NULL) {
-                WARN("QMEM alloc failed for PrivateData\n");
-                goto err;
-            }
-        }
-
-        opd = &qctx->qop[i].op_data;
-
-        /* Copy the opData template */
-        memcpy(opd, &template_opData, sizeof(template_opData));
-
-        /* Update Opdata */
-        opd->sessionCtx = qctx->session_ctx;
-        opd->pIv = qaeCryptoMemAlloc(EVP_CIPHER_CTX_iv_length(ctx),
-                                     __FILE__, __LINE__);
-        if (opd->pIv == NULL) {
-            WARN("QMEM Mem Alloc failed for pIv for pipe %d.\n", i);
-            goto err;
-        }
-
-        opd->ivLenInBytes = (Cpa32U) EVP_CIPHER_CTX_iv_length(ctx);
-    }
-
-    DEBUG_PPL("[%p] qop setup for %u elements\n", ctx, qctx->qop_len);
     return 1;
 
- err:
-    qat_chained_ipsec_ciphers_free_qop(&qctx->qop, &qctx->qop_len);
+err:
     return 0;
 }
 
@@ -507,6 +537,7 @@ int qat_chained_ipsec_ciphers_init(EVP_CIPHER_CTX *ctx,
     int ckeylen;
     int dlen;
     int ret = 0;
+    int i = 0;
 
     if (ctx == NULL || inkey == NULL) {
         WARN("ctx or inkey is NULL.\n");
@@ -644,8 +675,20 @@ int qat_chained_ipsec_ciphers_init(EVP_CIPHER_CTX *ctx,
 
     qctx->session_ctx = sctx;
 
-    qctx->qop = NULL;
-    qctx->qop_len = 0;
+    qctx->queue_depth = 0;
+    qctx->qop_id = 0;
+    qctx->qop_len = CB_QOP_QUEUE_MAX;
+    qctx->qop = (qat_op_params *) OPENSSL_zalloc(sizeof(qat_op_params)
+                                                    * qctx->qop_len);
+    if (qctx->qop == NULL) {
+        WARN("Unable to allocate memory[%lu bytes] for qat op params\n",
+                sizeof(qat_op_params) * qctx->qop_len);
+        goto err;
+    }
+
+    for (i = 0; i < qctx->qop_len; i++) {
+        qat_setup_op_params(ctx, &qctx->qop[i]);
+    }
 
     INIT_SEQ_SET_FLAG(qctx, INIT_SEQ_QAT_CTX_INIT);
 
@@ -906,11 +949,9 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
     CpaFlatBuffer *s_fbuf = NULL;
     CpaFlatBuffer *d_fbuf = NULL;
     int retVal = 0, job_ret = 0;
-    unsigned int pad_check = 1;
     int pad_len = 0;
     int plen = 0;
     int plen_adj = 0;
-    op_done_pipe_t done;
     qat_chained_ctx *qctx = NULL;
     unsigned char *inb, *outb;
     unsigned int ivlen = 0;
@@ -919,8 +960,10 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
     int pipe = 0;
     int error = 0;
     int outlen = -1;
-    void *app_data = NULL;
     thread_local_variables_t *tlv = NULL;
+    inf_op_done_t  *cb_op_done = NULL;
+    inf_app_data_t *app_data = NULL;
+    int pull_count = 0;
 
     if (ctx == NULL) {
         WARN("CTX parameter is NULL.\n");
@@ -930,6 +973,11 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
     qctx = qat_chained_data(ctx);
     if (qctx == NULL) {
         WARN("QAT CTX NULL\n");
+        return -1;
+    }
+
+    if (qctx->queue_depth >= CB_QOP_QUEUE_MAX - 1) {
+        g_inf_cb_stats.queue_full++;
         return -1;
     }
 
@@ -1002,7 +1050,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
                 return -1; /* Fail if software fallback not enabled. */
             }
         } else {
-            sts = cpaCySymInitSession(qat_instance_handles[qctx->inst_num], qat_chained_callbackFn,
+            sts = cpaCySymInitSession(qat_instance_handles[qctx->inst_num], qat_chained_ipsec_callbackFn,
                                       qctx->session_data, qctx->session_ctx);
             if (sts != CPA_STATUS_SUCCESS) {
                 WARN("cpaCySymInitSession failed! Status = %d\n", sts);
@@ -1095,8 +1143,10 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         qctx->p_inlen = &len;
     }
 
-    DEBUG_PPL("[%p] Start Cipher operation with num pipes %u\n",
-              ctx, qctx->numpipes);
+#if 0
+    DEBUG("[%p] Start Cipher operation with inst %u\n",
+              ctx, qctx->inst_num);
+#endif
 
     tlv = qat_check_create_local_variables();
     if (NULL == tlv) {
@@ -1115,32 +1165,32 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         }
     }
 
-    if ((qat_setup_op_params(ctx) != 1) ||
-        (qat_init_op_done_pipe(&done, qctx->numpipes) != 1)) {
+    cb_op_done = OPENSSL_zalloc(sizeof(inf_op_done_t));
+    cb_op_done->qop = &qctx->qop[qctx->qop_id];
+    qctx->qop_id = (qctx->qop_id + 1) % CB_QOP_QUEUE_MAX;
+    if ((qat_init_cb_op_done(cb_op_done) != 1) ||
+        (qat_setup_cb_op_data(ctx, cb_op_done->qop) != 1)) {
         WARN("Failure in qat_setup_op_params or qat_init_op_done_pipe\n");
         QAT_DEC_IN_FLIGHT_REQS(num_requests_in_flight, tlv);
         return -1;
     }
 
     do {
-        opd = &qctx->qop[pipe].op_data;
-        s_fbuf = qctx->qop[pipe].src_fbuf;
-        d_fbuf = qctx->qop[pipe].dst_fbuf;
-        s_sgl = &qctx->qop[pipe].src_sgl;
-        d_sgl = &qctx->qop[pipe].src_sgl;
+        opd = &cb_op_done->qop->op_data;
+        s_fbuf = cb_op_done->qop->src_fbuf;
+        d_fbuf = cb_op_done->qop->dst_fbuf;
+        s_sgl = &cb_op_done->qop->src_sgl;
+        d_sgl = &cb_op_done->qop->src_sgl;
         inb = &qctx->p_in[pipe][0];
         outb = &qctx->p_out[pipe][0];
         buflen = qctx->p_inlen[pipe];
 
-        if (qctx->numpipes > 1) {
-            WARN("Pipe %d tls hdr version < tls1.1\n", pipe);
-            error = 1;
-            break;
-        }
-        if ((app_data = EVP_CIPHER_CTX_get_app_data(ctx)) != NULL) {
-           memcpy(opd->pIv, app_data, ivlen);
+        if ((app_data = (inf_app_data_t*)EVP_CIPHER_CTX_get_app_data(ctx)) != NULL) {
+            memcpy(opd->pIv, app_data->iv, ivlen);
+            /* make a copy and free */
+            memcpy(&cb_op_done->app_data, app_data, sizeof(inf_app_data_t));
         } else  {
-           memcpy(opd->pIv, EVP_CIPHER_CTX_iv(ctx), ivlen);
+            memcpy(opd->pIv, EVP_CIPHER_CTX_iv(ctx), ivlen);
         }
 
         /* Calculate payload and padding len */
@@ -1170,12 +1220,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         }
 
 
-        FLATBUFF_ALLOC_AND_CHAIN(s_fbuf[1], d_fbuf[1], buflen);
-        if ((s_fbuf[1].pData) == NULL) {
-            WARN("Failure in src buffer allocation.\n");
-            error = 1;
-            break;
-        }
+        FLATBUFF_CHAIN_LEN(s_fbuf[1], d_fbuf[1], buflen);
 
         memcpy(d_fbuf[1].pData, inb, buflen - discardlen);
         if (enc) {
@@ -1187,9 +1232,21 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         DUMP_SYM_PERFORM_OP(qat_instance_handles[qctx->inst_num], opd, s_sgl, d_sgl);
 
         /* Increment prior to successful submission */
-        done.num_submitted++;
+        cb_op_done->num_submitted++;
 
-        sts = qat_sym_perform_op(qctx->inst_num, &done, opd, s_sgl,
+        cb_op_done->ctx = ctx;
+        cb_op_done->ivlen = ivlen;
+        cb_op_done->enc = enc;
+
+        cb_op_done->qctx_out_len = len - discardlen - plen_adj + IPSEC_ICV_LENGTH;
+        cb_op_done->qctx_out_dst = out + plen_adj;
+        cb_op_done->qctx_out_src = cb_op_done->qop->dst_fbuf[1].pData;
+        cb_op_done->qctx_outb = outb + buflen - discardlen - ivlen;
+
+        g_inf_cb_stats.submit_count++;
+        qctx->queue_depth++;
+
+        sts = qat_sym_perform_op(qctx->inst_num, cb_op_done, opd, s_sgl,
                                  d_sgl, &(qctx->session_data->verifyDigest));
 
         if (sts != CPA_STATUS_SUCCESS) {
@@ -1204,7 +1261,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
             WARN("Failed to submit request to qat - status = %d\n", sts);
             error = 1;
             /* Decrement after failed submission */
-            done.num_submitted--;
+            cb_op_done->num_submitted--;
             break;
         }
         if (qat_get_sw_fallback_enabled()) {
@@ -1215,16 +1272,9 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         }
     } while (++pipe < qctx->numpipes);
 
-    /* If there has been an error during submission of the pipes
-     * indicate to the callback function not to wait for the entire
-     * pipeline.
-     */
-    if (error == 1)
-        done.num_pipes = pipe;
-
     /* If there is nothing to wait for, do not pause or yield */
-    if (done.num_submitted == 0 || (done.num_submitted == done.num_processed)) {
-        if (done.opDone.job != NULL) {
+    if (cb_op_done->num_submitted == 0 || (cb_op_done->num_submitted == cb_op_done->num_processed)) {
+        if (cb_op_done->opDone.job != NULL) {
             qat_clear_async_event_notification();
         }
         goto end;
@@ -1234,8 +1284,33 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         QAT_ATOMIC_INC(num_cipher_pipeline_requests_in_flight);
     }
 
+    outlen = buflen + plen_adj - discardlen + IPSEC_ICV_LENGTH;
+
+    if (cb_op_done-> mode & INF_ASYNC_MODE_CB) {
+        if (qctx->queue_depth < CB_QOP_BURST_MAX)
+        {
+            return outlen;
+        }
+
+        sts = CPA_STATUS_SUCCESS;
+        do {
+            sts = poll_instances();
+            if (sts == CPA_STATUS_SUCCESS) {
+                pull_count++;
+            } else {
+                g_inf_cb_stats.retry_count++;
+            }
+            if (pull_count > g_inf_cb_stats.pull_max) {
+                g_inf_cb_stats.pull_max = pull_count;
+            }
+        } while (sts == CPA_STATUS_SUCCESS);
+
+        return outlen;
+    }
+
+
     do {
-        if (done.opDone.job != NULL) {
+        if (cb_op_done->opDone.job != NULL) {
             /* If we get a failure on qat_pause_job then we will
                not flag an error here and quit because we have
                an asynchronous request in flight.
@@ -1244,49 +1319,20 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
                qat_pause_job fails we will just yield and
                loop around and try again until the request
                completes and we can continue. */
-            if ((job_ret = qat_pause_job(done.opDone.job, ASYNC_STATUS_OK)) == 0)
+            if ((job_ret = qat_pause_job(cb_op_done->opDone.job, ASYNC_STATUS_OK)) == 0)
                 pthread_yield();
         } else {
+            poll_instances();
             pthread_yield();
         }
-    } while (!done.opDone.flag ||
+    } while (!cb_op_done->opDone.flag ||
              QAT_CHK_JOB_RESUMED_UNEXPECTEDLY(job_ret));
-
  end:
-    qctx->total_op += done.num_processed;
-    DUMP_SYM_PERFORM_OP_OUTPUT(&(qctx->session_data->verifyDigest), d_sgl);
     QAT_DEC_IN_FLIGHT_REQS(num_requests_in_flight, tlv);
 
-    if (error == 0 && (done.opDone.verifyResult == CPA_TRUE)) {
-        retVal = 1 & pad_check;
-        if (retVal == 1)
-            outlen = 0;
-    } else {
-        if (qat_get_sw_fallback_enabled() && done.opDone.verifyResult == CPA_FALSE) {
-            CRYPTO_QAT_LOG("Verification of result failed for qat inst_num %d device_id %d - fallback to SW - %s\n",
-                           qctx->inst_num,
-                           qat_instance_details[qctx->inst_num].qat_instance_info.physInstId.packageId,
-                           __func__);
-            qctx->fallback = 1; /* Probably already set anyway */
-        }
-    }
-    qat_cleanup_op_done_pipe(&done);
-    pipe = 0;
-    do {
-        if (retVal == 1) {
-            memcpy(qctx->p_out[pipe] + plen_adj,
-                   qctx->qop[pipe].dst_fbuf[1].pData,
-                   qctx->p_inlen[pipe] - discardlen - plen_adj + IPSEC_ICV_LENGTH);
-            outlen += buflen + plen_adj - discardlen + IPSEC_ICV_LENGTH;
-        }
-        qaeCryptoMemFreeNonZero(qctx->qop[pipe].src_fbuf[1].pData);
-        qctx->qop[pipe].src_fbuf[1].pData = NULL;
-        qctx->qop[pipe].dst_fbuf[1].pData = NULL;
-    } while (++pipe < qctx->numpipes);
+    qat_chained_ipsec_bottom_half(cb_op_done);
+    OPENSSL_free(cb_op_done);
 
-    if (enc)
-        memcpy(EVP_CIPHER_CTX_iv_noconst(ctx),
-               outb + buflen - discardlen - ivlen, ivlen);
 
 #ifndef OPENSSL_ENABLE_QAT_SMALL_PACKET_CIPHER_OFFLOADS
 cleanup:
@@ -1325,4 +1371,51 @@ fallback:
             ? qctx->numpipes : qctx->npipes_last_used;
     }
     return outlen;
+}
+
+int qat_chained_ipsec_bottom_half(inf_op_done_t *cb_op_done)
+{
+    EVP_CIPHER_CTX *ctx = cb_op_done->ctx;
+    qat_chained_ctx *qctx = qat_chained_data(ctx);
+    inf_app_data_t *app_data = &cb_op_done->app_data;
+    int ivlen = cb_op_done->ivlen;
+    CpaBufferList *d_sgl = &cb_op_done->qop->src_sgl;
+
+    /* Callback issued */
+    qctx->queue_depth--;
+
+    g_inf_cb_stats.callback_count++;
+    qctx->queue_depth = g_inf_cb_stats.submit_count - g_inf_cb_stats.callback_count;
+    if ( qctx->queue_depth > g_inf_cb_stats.queue_max) {
+        g_inf_cb_stats.queue_max = qctx->queue_depth;
+    }
+
+    if (cb_op_done->opDone.flag != 1 ||
+        cb_op_done->opDone.verifyResult != CPA_TRUE) {
+        /* Callback miss */
+        WARN("QAT Callback miss\n");
+        g_inf_cb_stats.callback_miss++;
+        return 0;
+    }
+
+    DUMP_SYM_PERFORM_OP_OUTPUT(&(qctx->session_data->verifyDigest), d_sgl);
+
+    memcpy(cb_op_done->qctx_out_dst,
+            cb_op_done->qctx_out_src,
+            cb_op_done->qctx_out_len);
+
+    if (cb_op_done->enc)
+        memcpy(EVP_CIPHER_CTX_iv_noconst(ctx),
+               cb_op_done->qctx_outb, ivlen);
+
+    qctx->total_op += cb_op_done->num_processed;
+
+    if (app_data->cb_fn && app_data->cb_arg) {
+        (*app_data->cb_fn)(app_data->cb_arg);
+    } else {
+        WARN("QAT app_data not found\n");
+        g_inf_cb_stats.callback_err++;
+    }
+
+    return 1;
 }

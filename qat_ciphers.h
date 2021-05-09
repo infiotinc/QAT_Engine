@@ -150,6 +150,9 @@ typedef struct qat_chained_ctx_t {
      */
     qat_op_params *qop;
     unsigned int qop_len;
+    unsigned int qop_id;
+
+    unsigned int queue_depth;
 
     /* Pipeline related Data */
     unsigned char **p_in;

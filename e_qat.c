@@ -180,7 +180,8 @@ int cleared_to_start = 0;
 char qat_config_section_name[QAT_CONFIG_SECTION_NAME_SIZE] = "SHIM";
 char *ICPConfigSectionName_libcrypto = qat_config_section_name;
 
-int enable_inline_polling = 0;
+/* Infiot Specific */
+int enable_inline_polling = 1;
 int enable_event_driven_polling = 0;
 int enable_instance_for_thread = 0;
 int disable_qat_offload = 0;
