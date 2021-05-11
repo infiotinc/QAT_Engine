@@ -170,11 +170,15 @@ typedef struct _inf_cb_stats {
     unsigned int    submit_count;
     unsigned int    retry_count;
     unsigned int    callback_count;
-    unsigned int    callback_miss;
-    unsigned int    callback_err;
+    unsigned int    callback_bh;
+    unsigned int    callback_eapp;
+    unsigned int    callback_eflag;
+    unsigned int    callback_eproc;
+    unsigned int    callback_etag;
+    unsigned int    callback_done;
 } inf_cb_stats_t;
 
-inf_cb_stats_t g_inf_cb_stats = {0};
+inf_cb_stats_t      g_inf_cb_stats = {0};
 
 static int qat_chained_ipsec_ciphers_init(EVP_CIPHER_CTX *ctx,
                                     const unsigned char *inkey,
@@ -346,8 +350,12 @@ static void qat_chained_ipsec_callbackFn(void *callbackTag, CpaStatus status,
     inf_op_done_t *opdone = (inf_op_done_t *)callbackTag;
     CpaBoolean res = CPA_FALSE;
 
+    /* Callback issued */
+    g_inf_cb_stats.callback_count++;
+
     if (opdone == NULL) {
         WARN("Callback Tag NULL\n");
+        g_inf_cb_stats.callback_etag++;
         return;
     }
 
@@ -369,8 +377,10 @@ static void qat_chained_ipsec_callbackFn(void *callbackTag, CpaStatus status,
      * i.e. first in first out. If not all requests have been
      * submitted or processed, wait for more callbacks.
      */
-    if ((opdone->num_submitted != opdone->num_processed))
+    if ((opdone->num_submitted != opdone->num_processed)) {
+        g_inf_cb_stats.callback_eproc++;
         return;
+    }
 
     if (enable_heuristic_polling) {
         QAT_ATOMIC_DEC(num_cipher_pipeline_requests_in_flight);
@@ -390,7 +400,6 @@ static void qat_chained_ipsec_callbackFn(void *callbackTag, CpaStatus status,
        qat_wake_job(job, ASYNC_STATUS_OK);
     } else if (opdone-> mode & INF_ASYNC_MODE_CB) {
         qat_chained_ipsec_bottom_half(opdone);
-        OPENSSL_free(opdone);
     }
 }
 
@@ -690,6 +699,15 @@ int qat_chained_ipsec_ciphers_init(EVP_CIPHER_CTX *ctx,
         qat_setup_op_params(ctx, &qctx->qop[i]);
     }
 
+    qctx->cop = (inf_op_done_t *) OPENSSL_zalloc(sizeof(inf_op_done_t)
+                                                    * qctx->qop_len);
+
+    if (qctx->cop == NULL) {
+        WARN("Unable to allocate memory[%lu bytes] for qat cb params\n",
+                sizeof(qat_op_params) * qctx->qop_len);
+        goto err;
+    }
+
     INIT_SEQ_SET_FLAG(qctx, INIT_SEQ_QAT_CTX_INIT);
 
     DEBUG_PPL("[%p] qat chained cipher ctx %p initialised\n",ctx, qctx);
@@ -890,6 +908,7 @@ int qat_chained_ipsec_ciphers_cleanup(EVP_CIPHER_CTX *ctx)
 
     /* ctx may be cleaned before it gets a chance to allocate qop */
     qat_chained_ipsec_ciphers_free_qop(&qctx->qop, &qctx->qop_len);
+    OPENSSL_free(qctx->cop);
 
     ssd = qctx->session_data;
     if (ssd) {
@@ -976,9 +995,19 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         return -1;
     }
 
-    if (qctx->queue_depth >= CB_QOP_QUEUE_MAX - 1) {
+
+    while (qctx->queue_depth >= CB_QOP_QUEUE_MAX - 1) {
         g_inf_cb_stats.queue_full++;
-        return -1;
+        pull_count = 0;
+        do {
+            sts = poll_instances();
+            if (sts == CPA_STATUS_SUCCESS) {
+                pull_count++;
+                if (pull_count > g_inf_cb_stats.pull_max) {
+                    g_inf_cb_stats.pull_max = pull_count;
+                }
+            }
+        } while(sts == CPA_STATUS_SUCCESS);
     }
 
     if (qctx->fallback == 1)
@@ -1076,6 +1105,10 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         }
     }
 
+    if (error) {
+        return -1;
+    }
+
     ivlen = EVP_CIPHER_CTX_iv_length(ctx);
     dlen = get_digest_len(EVP_CIPHER_CTX_nid(ctx));
 
@@ -1165,7 +1198,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         }
     }
 
-    cb_op_done = OPENSSL_zalloc(sizeof(inf_op_done_t));
+    cb_op_done = &((inf_op_done_t*)qctx->cop)[qctx->qop_id];
     cb_op_done->qop = &qctx->qop[qctx->qop_id];
     qctx->qop_id = (qctx->qop_id + 1) % CB_QOP_QUEUE_MAX;
     if ((qat_init_cb_op_done(cb_op_done) != 1) ||
@@ -1292,6 +1325,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
             return outlen;
         }
 
+        pull_count = 0;
         sts = CPA_STATUS_SUCCESS;
         do {
             sts = poll_instances();
@@ -1331,7 +1365,6 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
     QAT_DEC_IN_FLIGHT_REQS(num_requests_in_flight, tlv);
 
     qat_chained_ipsec_bottom_half(cb_op_done);
-    OPENSSL_free(cb_op_done);
 
 
 #ifndef OPENSSL_ENABLE_QAT_SMALL_PACKET_CIPHER_OFFLOADS
@@ -1381,20 +1414,24 @@ int qat_chained_ipsec_bottom_half(inf_op_done_t *cb_op_done)
     int ivlen = cb_op_done->ivlen;
     CpaBufferList *d_sgl = &cb_op_done->qop->src_sgl;
 
-    /* Callback issued */
-    qctx->queue_depth--;
+    g_inf_cb_stats.callback_bh++;
 
-    g_inf_cb_stats.callback_count++;
-    qctx->queue_depth = g_inf_cb_stats.submit_count - g_inf_cb_stats.callback_count;
+    if (qctx->queue_depth > 0) {
+        qctx->queue_depth--;
+    } else {
+        WARN("QUEUE DEPTH NEGATIVE\n");
+    }
+
     if ( qctx->queue_depth > g_inf_cb_stats.queue_max) {
         g_inf_cb_stats.queue_max = qctx->queue_depth;
+        WARN("QUEUE_MAX %d\n", g_inf_cb_stats.queue_max);
     }
 
     if (cb_op_done->opDone.flag != 1 ||
         cb_op_done->opDone.verifyResult != CPA_TRUE) {
         /* Callback miss */
         WARN("QAT Callback miss\n");
-        g_inf_cb_stats.callback_miss++;
+        g_inf_cb_stats.callback_eflag++;
         return 0;
     }
 
@@ -1414,8 +1451,10 @@ int qat_chained_ipsec_bottom_half(inf_op_done_t *cb_op_done)
         (*app_data->cb_fn)(app_data->cb_arg);
     } else {
         WARN("QAT app_data not found\n");
-        g_inf_cb_stats.callback_err++;
+        g_inf_cb_stats.callback_eapp++;
     }
+
+    g_inf_cb_stats.callback_done++;
 
     return 1;
 }
