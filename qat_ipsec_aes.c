@@ -80,6 +80,7 @@
 #include "cpa.h"
 #include "cpa_types.h"
 #include "cpa_cy_sym.h"
+#include "icp_sal_poll.h"
 #include "qat_ciphers.h"
 #include "qat_constant_time.h"
 
@@ -132,7 +133,7 @@
 #define INF_ASYNC_MODE_BH   1 << 0
 #define INF_ASYNC_MODE_CB   1 << 1
 
-#define CB_QOP_QUEUE_MAX    32
+#define CB_QOP_QUEUE_MAX    16
 #define CB_QOP_BURST_MAX    8
 
 typedef struct _inf_app_data {
@@ -263,6 +264,11 @@ static inline const EVP_CIPHER *get_cipher_from_nid(int nid)
             WARN("Invalid nid %d\n", nid);
             return NULL;
     }
+}
+
+static inline CpaStatus qat_chained_ipsec_poll_instance(unsigned int inst_num)
+{
+    return icp_sal_CyPollInstance(qat_instance_handles[inst_num], 0);
 }
 
 
@@ -1000,7 +1006,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         g_inf_cb_stats.queue_full++;
         pull_count = 0;
         do {
-            sts = poll_instances();
+            sts = qat_chained_ipsec_poll_instance(qctx->inst_num);
             if (sts == CPA_STATUS_SUCCESS) {
                 pull_count++;
                 if (pull_count > g_inf_cb_stats.pull_max) {
@@ -1328,7 +1334,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         pull_count = 0;
         sts = CPA_STATUS_SUCCESS;
         do {
-            sts = poll_instances();
+            sts = qat_chained_ipsec_poll_instance(qctx->inst_num);
             if (sts == CPA_STATUS_SUCCESS) {
                 pull_count++;
             } else {
@@ -1356,7 +1362,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
             if ((job_ret = qat_pause_job(cb_op_done->opDone.job, ASYNC_STATUS_OK)) == 0)
                 pthread_yield();
         } else {
-            poll_instances();
+            qat_chained_ipsec_poll_instance(qctx->inst_num);
             pthread_yield();
         }
     } while (!cb_op_done->opDone.flag ||
