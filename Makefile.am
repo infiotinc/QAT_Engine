@@ -84,7 +84,7 @@ AM_CFLAGS = $(cflags) $(cflags_cc_opt) $(cflags_qat_intree)           \
             $(enable_qat_debug) $(enable_qat_warnings)                \
             $(enable_qat_mem_debug) $(enable_qat_mem_warnings)        \
             $(cflags_qat_debug_file) $(enable_qat_cycle_counts)       \
-            $(enable_multibuff_heuristic_timeout)
+            $(enable_multibuff_heuristic_timeout) $(enable_qat_infiot)
 
 
 qatengine_la_LDFLAGS = -module -no-undefined -avoid-version \

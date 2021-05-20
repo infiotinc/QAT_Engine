@@ -180,8 +180,12 @@ int cleared_to_start = 0;
 char qat_config_section_name[QAT_CONFIG_SECTION_NAME_SIZE] = "SHIM";
 char *ICPConfigSectionName_libcrypto = qat_config_section_name;
 
+#ifdef QAT_INFIOT
 /* Infiot Specific */
 int enable_inline_polling = 1;
+#else
+int enable_inline_polling = 0;
+#endif
 int enable_event_driven_polling = 0;
 int enable_instance_for_thread = 0;
 int disable_qat_offload = 0;
@@ -930,8 +934,10 @@ static int bind_qat(ENGINE *e, const char *id)
     }
 #endif
 
+#ifndef QAT_INFIOT
     pthread_atfork(engine_finish_before_fork_handler, NULL,
                    engine_init_child_at_fork_handler);
+#endif
 
     ret = 1;
     ret &= ENGINE_set_destroy_function(e, qat_engine_destroy);

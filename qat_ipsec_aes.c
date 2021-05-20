@@ -134,7 +134,7 @@
 #define INF_ASYNC_MODE_CB   1 << 1
 
 #define CB_QOP_QUEUE_MAX    16
-#define CB_QOP_BURST_MAX    8
+#define CB_QOP_BURST_MAX    4
 
 typedef struct _inf_app_data {
     u_int8_t    *iv;
@@ -192,6 +192,8 @@ static int qat_chained_ipsec_ciphers_ctrl(EVP_CIPHER_CTX *ctx, int type, int arg
                                     void *ptr);
 
 static int qat_chained_ipsec_bottom_half(inf_op_done_t *cb_op_done);
+
+static int qat_chained_ipsec_inst_num(int enc);
 
 #endif
 
@@ -271,6 +273,34 @@ static inline CpaStatus qat_chained_ipsec_poll_instance(unsigned int inst_num)
     return icp_sal_CyPollInstance(qat_instance_handles[inst_num], 0);
 }
 
+
+static int qat_chained_ipsec_inst_num(int enc)
+{
+    int inst_num = QAT_INVALID_INSTANCE;
+    thread_local_variables_t * tlv = NULL;
+    int dec_inst = 0;
+    int enc_inst = 1;
+
+    tlv = qat_check_create_local_variables();
+    if (unlikely(NULL == tlv)) {
+        WARN("No local variables are available\n");
+        return inst_num;
+    }
+
+    if (likely(qat_instance_handles && qat_num_instances)) {
+        do {
+            tlv->qatInstanceNumForThread = enc ? enc_inst : dec_inst;
+        } while (!is_instance_available(tlv->qatInstanceNumForThread));
+        inst_num = tlv->qatInstanceNumForThread;
+    }
+
+    /* If no working instance could be found then flag a warning */
+    if (unlikely(inst_num == QAT_INVALID_INSTANCE)) {
+        WARN("No working instance is available\n");
+    }
+
+    return inst_num;
+}
 
 static inline void qat_chained_ipsec_ciphers_free_qop(qat_op_params **pqop,
         unsigned int *num_elem)
@@ -654,7 +684,7 @@ int qat_chained_ipsec_ciphers_init(EVP_CIPHER_CTX *ctx,
 
     ssd->hashSetupData.authModeSetupData.authKey = qctx->hmac_key;
 
-    qctx->inst_num = get_next_inst_num();
+    qctx->inst_num = qat_chained_ipsec_inst_num(enc);
     if (qctx->inst_num == QAT_INVALID_INSTANCE) {
         WARN("Failed to get a QAT instance.\n");
         if (qat_get_sw_fallback_enabled()) {

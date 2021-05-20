@@ -18,6 +18,11 @@ AC_PROG_CXX
 AC_PROG_CC
 
 # Parameter parsing for disabling the feature
+AC_ARG_ENABLE(qat_infiot,
+              AS_HELP_STRING([--enable-qat_infiot],
+                             [Enable Infiot QAT features]))
+AC_SUBST(enable_qat_infiot)
+
 AC_ARG_ENABLE(qat_rsa,
               AS_HELP_STRING([--disable-qat_rsa],
                              [Disable accelerated RSA offload]))
@@ -351,6 +356,15 @@ fi
 AM_CONDITIONAL([QAT_ERR_FILES_BUILD], [test "x$with_openssl_dir" != "x"])
 
 # Checking the parameters given and parsing the relevant flags
+if test "x$enable_qat_infiot" = "xyes"
+then
+  enable_qat_infiot="-DQAT_INFIOT"
+  AC_MSG_NOTICE([Enabling Infiot QAT support])
+else
+  enable_qat_infiot=""
+  AC_MSG_NOTICE([Disabling Infiot QAT support])
+fi
+
 if test "x$enable_qat_rsa" != "xno" -a "x$cflags_qat_offload" != "x"
 then
   enable_qat_rsa="-DOPENSSL_ENABLE_QAT_RSA"
