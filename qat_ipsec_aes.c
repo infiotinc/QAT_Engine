@@ -168,6 +168,7 @@ typedef struct _inf_cb_stats {
     unsigned int    queue_full;
     unsigned int    queue_max;
     unsigned int    pull_max;
+    unsigned int    submit_esess;
     unsigned int    submit_count;
     unsigned int    retry_count;
     unsigned int    callback_count;
@@ -268,7 +269,7 @@ static inline const EVP_CIPHER *get_cipher_from_nid(int nid)
     }
 }
 
-static inline CpaStatus qat_chained_ipsec_poll_instance(unsigned int inst_num)
+CpaStatus qat_chained_ipsec_poll_instance(unsigned int inst_num)
 {
     return icp_sal_CyPollInstance(qat_instance_handles[inst_num], 0);
 }
@@ -463,6 +464,12 @@ int qat_setup_cb_op_data(EVP_CIPHER_CTX *ctx, qat_op_params *qop)
     /* Update Opdata */
     opd->sessionCtx = qctx->session_ctx;
 
+    if (!opd->sessionCtx) {
+	    WARN("Failed to set session ctx\n");
+        g_inf_cb_stats.submit_esess++;
+        return 0;
+    }
+
     return 1;
 }
 
@@ -583,6 +590,8 @@ int qat_chained_ipsec_ciphers_init(EVP_CIPHER_CTX *ctx,
     int dlen;
     int ret = 0;
     int i = 0;
+
+    WARN("Initializing new QAT session.\n");
 
     if (ctx == NULL || inkey == NULL) {
         WARN("ctx or inkey is NULL.\n");

@@ -182,6 +182,7 @@ char *ICPConfigSectionName_libcrypto = qat_config_section_name;
 
 #ifdef QAT_INFIOT
 /* Infiot Specific */
+CpaStatus qat_chained_ipsec_poll_instance(unsigned int inst_num);
 int enable_inline_polling = 1;
 #else
 int enable_inline_polling = 0;
@@ -535,12 +536,19 @@ int qat_engine_ctrl(ENGINE *e, int cmd, long i, void *p, void (*f) (void))
     switch (cmd) {
         case QAT_CMD_POLL:
             BREAK_IF(!engine_inited, "POLL failed as engine is not initialized\n");
+#ifndef QAT_INFIOT
             BREAK_IF(!enable_external_polling, "POLL failed as external polling is not enabled\n");
+#endif
             BREAK_IF(p == NULL, "POLL failed as the input parameter was NULL\n");
 #ifdef OPENSSL_QAT_OFFLOAD
             BREAK_IF(qat_instance_handles == NULL, "POLL failed as no instances are available\n");
 
+#ifdef QAT_INFIOT
+            *(int *)p = qat_chained_ipsec_poll_instance(*(unsigned int*)p);
+#else
             *(int *)p = (int)poll_instances();
+#endif
+
 #endif
 
 #ifdef OPENSSL_MULTIBUFF_OFFLOAD
