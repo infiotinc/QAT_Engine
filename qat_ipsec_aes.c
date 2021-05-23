@@ -174,6 +174,7 @@ typedef struct _inf_cb_stats {
     unsigned int    callback_count;
     unsigned int    callback_bh;
     unsigned int    callback_eapp;
+    unsigned int    callback_edepth;
     unsigned int    callback_eflag;
     unsigned int    callback_eproc;
     unsigned int    callback_etag;
@@ -271,7 +272,22 @@ static inline const EVP_CIPHER *get_cipher_from_nid(int nid)
 
 CpaStatus qat_chained_ipsec_poll_instance(unsigned int inst_num)
 {
-    return icp_sal_CyPollInstance(qat_instance_handles[inst_num], 0);
+    CpaStatus sts = CPA_STATUS_SUCCESS;
+    int pull_count = 0;
+
+    do {
+        sts = icp_sal_CyPollInstance(qat_instance_handles[inst_num], 0);
+        if (sts == CPA_STATUS_SUCCESS) {
+            pull_count++;
+        } else {
+            g_inf_cb_stats.retry_count++;
+        }
+        if (pull_count > g_inf_cb_stats.pull_max) {
+            g_inf_cb_stats.pull_max = pull_count;
+        }
+    } while (sts == CPA_STATUS_SUCCESS);
+
+    return sts;
 }
 
 
@@ -591,8 +607,6 @@ int qat_chained_ipsec_ciphers_init(EVP_CIPHER_CTX *ctx,
     int ret = 0;
     int i = 0;
 
-    WARN("Initializing new QAT session.\n");
-
     if (ctx == NULL || inkey == NULL) {
         WARN("ctx or inkey is NULL.\n");
         return 0;
@@ -603,6 +617,8 @@ int qat_chained_ipsec_ciphers_init(EVP_CIPHER_CTX *ctx,
         WARN("qctx is NULL.\n");
         return 0;
     }
+
+    WARN("Initializing new QAT session %p/%p.\n", ctx, qctx);
 
     INIT_SEQ_CLEAR_ALL_FLAGS(qctx);
 
@@ -934,6 +950,7 @@ int qat_chained_ipsec_ciphers_cleanup(EVP_CIPHER_CTX *ctx)
     CpaStatus sts = 0;
     CpaCySymSessionSetupData *ssd = NULL;
     int retVal = 1;
+    int retry = 0;
 
     if (ctx == NULL) {
         WARN("ctx parameter is NULL.\n");
@@ -945,6 +962,17 @@ int qat_chained_ipsec_ciphers_cleanup(EVP_CIPHER_CTX *ctx)
         WARN("qctx parameter is NULL.\n");
         return 0;
     }
+
+    WARN("Clearing QAT session q(%d) %p/%p.\n", qctx->queue_depth , ctx, qctx);
+
+    do {
+        if (retry) {
+            WARN("Draining qctx retry %d\n", retry);
+            usleep(200000); /* 0.2 sec */
+        }
+        qat_chained_ipsec_poll_instance(qctx->inst_num);
+        retry++;
+    } while (qctx->queue_depth > 0 && retry < 3);
 
     if (qctx->sw_ctx_cipher_data != NULL) {
         OPENSSL_free(qctx->sw_ctx_cipher_data);
@@ -1027,7 +1055,6 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
     thread_local_variables_t *tlv = NULL;
     inf_op_done_t  *cb_op_done = NULL;
     inf_app_data_t *app_data = NULL;
-    int pull_count = 0;
 
     if (ctx == NULL) {
         WARN("CTX parameter is NULL.\n");
@@ -1043,16 +1070,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
 
     while (qctx->queue_depth >= CB_QOP_QUEUE_MAX - 1) {
         g_inf_cb_stats.queue_full++;
-        pull_count = 0;
-        do {
-            sts = qat_chained_ipsec_poll_instance(qctx->inst_num);
-            if (sts == CPA_STATUS_SUCCESS) {
-                pull_count++;
-                if (pull_count > g_inf_cb_stats.pull_max) {
-                    g_inf_cb_stats.pull_max = pull_count;
-                }
-            }
-        } while(sts == CPA_STATUS_SUCCESS);
+	    qat_chained_ipsec_poll_instance(qctx->inst_num);
     }
 
     if (qctx->fallback == 1)
@@ -1370,20 +1388,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
             return outlen;
         }
 
-        pull_count = 0;
-        sts = CPA_STATUS_SUCCESS;
-        do {
-            sts = qat_chained_ipsec_poll_instance(qctx->inst_num);
-            if (sts == CPA_STATUS_SUCCESS) {
-                pull_count++;
-            } else {
-                g_inf_cb_stats.retry_count++;
-            }
-            if (pull_count > g_inf_cb_stats.pull_max) {
-                g_inf_cb_stats.pull_max = pull_count;
-            }
-        } while (sts == CPA_STATUS_SUCCESS);
-
+        qat_chained_ipsec_poll_instance(qctx->inst_num);
         return outlen;
     }
 
@@ -1464,7 +1469,10 @@ int qat_chained_ipsec_bottom_half(inf_op_done_t *cb_op_done)
     if (qctx->queue_depth > 0) {
         qctx->queue_depth--;
     } else {
-        WARN("QUEUE DEPTH NEGATIVE\n");
+        g_inf_cb_stats.callback_edepth++;
+        if (g_inf_cb_stats.callback_edepth % 100 == 0) {
+            WARN("QUEUE DEPTH negative\n");
+        }
     }
 
     if ( qctx->queue_depth > g_inf_cb_stats.queue_max) {
