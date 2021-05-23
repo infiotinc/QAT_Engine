@@ -181,7 +181,7 @@ typedef struct _inf_cb_stats {
     unsigned int    callback_done;
 } inf_cb_stats_t;
 
-inf_cb_stats_t      g_inf_cb_stats = {0};
+inf_cb_stats_t      g_inf_cb_stats[2] = {0};
 
 static int qat_chained_ipsec_ciphers_init(EVP_CIPHER_CTX *ctx,
                                     const unsigned char *inkey,
@@ -280,10 +280,10 @@ CpaStatus qat_chained_ipsec_poll_instance(unsigned int inst_num)
         if (sts == CPA_STATUS_SUCCESS) {
             pull_count++;
         } else {
-            g_inf_cb_stats.retry_count++;
+            g_inf_cb_stats[inst_num].retry_count++;
         }
-        if (pull_count > g_inf_cb_stats.pull_max) {
-            g_inf_cb_stats.pull_max = pull_count;
+        if (pull_count > g_inf_cb_stats[inst_num].pull_max) {
+            g_inf_cb_stats[inst_num].pull_max = pull_count;
         }
     } while (sts == CPA_STATUS_SUCCESS);
 
@@ -402,13 +402,14 @@ static void qat_chained_ipsec_callbackFn(void *callbackTag, CpaStatus status,
     ASYNC_JOB *job = NULL;
     inf_op_done_t *opdone = (inf_op_done_t *)callbackTag;
     CpaBoolean res = CPA_FALSE;
+    int enc = opdone->enc;
 
     /* Callback issued */
-    g_inf_cb_stats.callback_count++;
+    g_inf_cb_stats[enc].callback_count++;
 
     if (opdone == NULL) {
         WARN("Callback Tag NULL\n");
-        g_inf_cb_stats.callback_etag++;
+        g_inf_cb_stats[enc].callback_etag++;
         return;
     }
 
@@ -431,7 +432,7 @@ static void qat_chained_ipsec_callbackFn(void *callbackTag, CpaStatus status,
      * submitted or processed, wait for more callbacks.
      */
     if ((opdone->num_submitted != opdone->num_processed)) {
-        g_inf_cb_stats.callback_eproc++;
+        g_inf_cb_stats[enc].callback_eproc++;
         return;
     }
 
@@ -482,7 +483,7 @@ int qat_setup_cb_op_data(EVP_CIPHER_CTX *ctx, qat_op_params *qop)
 
     if (!opd->sessionCtx) {
 	    WARN("Failed to set session ctx\n");
-        g_inf_cb_stats.submit_esess++;
+        g_inf_cb_stats[qctx->inst_num].submit_esess++;
         return 0;
     }
 
@@ -1069,7 +1070,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
 
 
     while (qctx->queue_depth >= CB_QOP_QUEUE_MAX - 1) {
-        g_inf_cb_stats.queue_full++;
+        g_inf_cb_stats[qctx->inst_num].queue_full++;
 	    qat_chained_ipsec_poll_instance(qctx->inst_num);
     }
 
@@ -1339,7 +1340,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         cb_op_done->qctx_out_src = cb_op_done->qop->dst_fbuf[1].pData;
         cb_op_done->qctx_outb = outb + buflen - discardlen - ivlen;
 
-        g_inf_cb_stats.submit_count++;
+        g_inf_cb_stats[qctx->inst_num].submit_count++;
         qctx->queue_depth++;
 
         sts = qat_sym_perform_op(qctx->inst_num, cb_op_done, opd, s_sgl,
@@ -1464,27 +1465,27 @@ int qat_chained_ipsec_bottom_half(inf_op_done_t *cb_op_done)
     int ivlen = cb_op_done->ivlen;
     CpaBufferList *d_sgl = &cb_op_done->qop->src_sgl;
 
-    g_inf_cb_stats.callback_bh++;
+    g_inf_cb_stats[qctx->inst_num].callback_bh++;
 
     if (qctx->queue_depth > 0) {
         qctx->queue_depth--;
     } else {
-        g_inf_cb_stats.callback_edepth++;
-        if (g_inf_cb_stats.callback_edepth % 100 == 0) {
+        g_inf_cb_stats[qctx->inst_num].callback_edepth++;
+        if (g_inf_cb_stats[qctx->inst_num].callback_edepth % 100 == 0) {
             WARN("QUEUE DEPTH negative\n");
         }
     }
 
-    if ( qctx->queue_depth > g_inf_cb_stats.queue_max) {
-        g_inf_cb_stats.queue_max = qctx->queue_depth;
-        WARN("QUEUE_MAX %d\n", g_inf_cb_stats.queue_max);
+    if ( qctx->queue_depth > g_inf_cb_stats[qctx->inst_num].queue_max) {
+        g_inf_cb_stats[qctx->inst_num].queue_max = qctx->queue_depth;
+        WARN("QUEUE_MAX %d\n", g_inf_cb_stats[qctx->inst_num].queue_max);
     }
 
     if (cb_op_done->opDone.flag != 1 ||
         cb_op_done->opDone.verifyResult != CPA_TRUE) {
         /* Callback miss */
         WARN("QAT Callback miss\n");
-        g_inf_cb_stats.callback_eflag++;
+        g_inf_cb_stats[qctx->inst_num].callback_eflag++;
         return 0;
     }
 
@@ -1504,10 +1505,10 @@ int qat_chained_ipsec_bottom_half(inf_op_done_t *cb_op_done)
         (*app_data->cb_fn)(app_data->cb_arg);
     } else {
         WARN("QAT app_data not found\n");
-        g_inf_cb_stats.callback_eapp++;
+        g_inf_cb_stats[qctx->inst_num].callback_eapp++;
     }
 
-    g_inf_cb_stats.callback_done++;
+    g_inf_cb_stats[qctx->inst_num].callback_done++;
 
     return 1;
 }
