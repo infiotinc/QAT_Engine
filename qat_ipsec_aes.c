@@ -1374,6 +1374,11 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         if (cb_op_done->opDone.job != NULL) {
             qat_clear_async_event_notification();
         }
+        if (cb_op_done->mode & INF_ASYNC_MODE_CB && cb_op_done->opDone.flag) {
+            return outlen;
+        } else if (cb_op_done->mode & INF_ASYNC_MODE_CB) {
+            return -1;
+        }
         goto end;
     }
 
