@@ -133,7 +133,8 @@
 #define INF_ASYNC_MODE_BH   1 << 0
 #define INF_ASYNC_MODE_CB   1 << 1
 
-#define CB_QOP_QUEUE_MAX    16
+#define CB_QOP_BUF_MAX      16
+#define CB_QOP_QUEUE_MAX    12
 #define CB_QOP_BURST_MAX    4
 
 typedef struct _inf_app_data {
@@ -165,11 +166,16 @@ typedef struct _inf_op_done {
 } inf_op_done_t;
 
 typedef struct _inf_cb_stats {
+    unsigned long   queue_max;
     unsigned int    queue_full;
-    unsigned int    queue_max;
     unsigned int    pull_max;
     unsigned int    submit_esess;
+    unsigned int    submit_eproc;
+    unsigned int    submit_bh;
+    unsigned int    submit_cb;
     unsigned int    submit_count;
+    unsigned int    submit_result;
+    unsigned int    submit_roll;
     unsigned int    retry_count;
     unsigned int    callback_count;
     unsigned int    callback_bh;
@@ -244,13 +250,39 @@ static inline int get_digest_len(int nid)
     return IPSEC_ICV_LENGTH;
 }
 
+static inline unsigned long  get_queue_depth(qat_chained_ctx *qctx)
+{
+    unsigned long q_depth;
+
+    if (qctx->qop_submit < qctx->qop_callback) {
+        g_inf_cb_stats[qctx->inst_num].submit_roll++;
+        WARN("QAT %p roll %d\n", qctx, g_inf_cb_stats[qctx->inst_num].submit_roll);
+        q_depth = (qctx->qop_submit + CB_QOP_QUEUE_MAX) - (qctx->qop_callback + CB_QOP_QUEUE_MAX);
+    } else {
+        q_depth = qctx->qop_submit - qctx->qop_callback;
+    }
+
+
+    if (q_depth < 0 || q_depth > CB_QOP_QUEUE_MAX) {
+        g_inf_cb_stats[qctx->inst_num].callback_edepth++;
+        WARN("QAT QUEUE_DEPTH %p 0x%lx (0x%lx/0x%lx)\n",
+            qctx, q_depth, qctx->qop_submit, qctx->qop_callback);
+        q_depth = CB_QOP_QUEUE_MAX;
+    }
+
+    if (q_depth > g_inf_cb_stats[qctx->inst_num].queue_max) {
+        g_inf_cb_stats[qctx->inst_num].queue_max = q_depth;
+        WARN("QAT QUEUE_MAX %p 0x%lx\n", qctx, g_inf_cb_stats[qctx->inst_num].queue_max);
+    }
+
+    return q_depth;
+}
+
 static inline const EVP_CIPHER *qat_chained_cipher_sw_impl(int nid)
 {
     switch (nid) {
         case NID_aes_128_cbc:
             return EVP_aes_128_cbc();
-        case NID_aes_256_cbc:
-            return EVP_aes_256_cbc();
         default:
             WARN("Invalid nid %d\n", nid);
             return NULL;
@@ -262,8 +294,6 @@ static inline const EVP_CIPHER *get_cipher_from_nid(int nid)
     switch (nid) {
         case NID_aes_128_cbc:
             return EVP_aes_128_cbc();
-        case NID_aes_256_cbc:
-            return EVP_aes_256_cbc();
         default:
             WARN("Invalid nid %d\n", nid);
             return NULL;
@@ -746,9 +776,10 @@ int qat_chained_ipsec_ciphers_init(EVP_CIPHER_CTX *ctx,
 
     qctx->session_ctx = sctx;
 
-    qctx->queue_depth = 0;
+    qctx->qop_submit = 0;
+    qctx->qop_callback = 0;
     qctx->qop_id = 0;
-    qctx->qop_len = CB_QOP_QUEUE_MAX;
+    qctx->qop_len = CB_QOP_BUF_MAX;
     qctx->qop = (qat_op_params *) OPENSSL_zalloc(sizeof(qat_op_params)
                                                     * qctx->qop_len);
     if (qctx->qop == NULL) {
@@ -964,7 +995,7 @@ int qat_chained_ipsec_ciphers_cleanup(EVP_CIPHER_CTX *ctx)
         return 0;
     }
 
-    WARN("Clearing QAT session q(%d) %p/%p.\n", qctx->queue_depth , ctx, qctx);
+    WARN("Clearing QAT session q(0x%lx) %p/%p.\n", get_queue_depth(qctx) , ctx, qctx);
 
     do {
         if (retry) {
@@ -973,7 +1004,7 @@ int qat_chained_ipsec_ciphers_cleanup(EVP_CIPHER_CTX *ctx)
         }
         qat_chained_ipsec_poll_instance(qctx->inst_num);
         retry++;
-    } while (qctx->queue_depth > 0 && retry < 3);
+    } while (get_queue_depth(qctx) > 0 && retry < 3);
 
     if (qctx->sw_ctx_cipher_data != NULL) {
         OPENSSL_free(qctx->sw_ctx_cipher_data);
@@ -1069,7 +1100,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
     }
 
 
-    while (qctx->queue_depth >= CB_QOP_QUEUE_MAX - 1) {
+    while (get_queue_depth(qctx) >= CB_QOP_QUEUE_MAX) {
         g_inf_cb_stats[qctx->inst_num].queue_full++;
 	    qat_chained_ipsec_poll_instance(qctx->inst_num);
     }
@@ -1264,7 +1295,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
 
     cb_op_done = &((inf_op_done_t*)qctx->cop)[qctx->qop_id];
     cb_op_done->qop = &qctx->qop[qctx->qop_id];
-    qctx->qop_id = (qctx->qop_id + 1) % CB_QOP_QUEUE_MAX;
+    qctx->qop_id = (qctx->qop_id + 1) % CB_QOP_BUF_MAX;
     if ((qat_init_cb_op_done(cb_op_done) != 1) ||
         (qat_setup_cb_op_data(ctx, cb_op_done->qop) != 1)) {
         WARN("Failure in qat_setup_op_params or qat_init_op_done_pipe\n");
@@ -1341,7 +1372,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
         cb_op_done->qctx_outb = outb + buflen - discardlen - ivlen;
 
         g_inf_cb_stats[qctx->inst_num].submit_count++;
-        qctx->queue_depth++;
+        qctx->qop_submit++;
 
         sts = qat_sym_perform_op(qctx->inst_num, cb_op_done, opd, s_sgl,
                                  d_sgl, &(qctx->session_data->verifyDigest));
@@ -1375,8 +1406,10 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
             qat_clear_async_event_notification();
         }
         if (cb_op_done->mode & INF_ASYNC_MODE_CB && cb_op_done->opDone.flag) {
+            g_inf_cb_stats[qctx->inst_num].submit_result++;
             return outlen;
         } else if (cb_op_done->mode & INF_ASYNC_MODE_CB) {
+            g_inf_cb_stats[qctx->inst_num].submit_eproc++;
             return -1;
         }
         goto end;
@@ -1389,12 +1422,14 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
     outlen = buflen + plen_adj - discardlen + IPSEC_ICV_LENGTH;
 
     if (cb_op_done-> mode & INF_ASYNC_MODE_CB) {
-        if (qctx->queue_depth < CB_QOP_BURST_MAX)
+        if (get_queue_depth(qctx) < CB_QOP_BURST_MAX)
         {
+            g_inf_cb_stats[qctx->inst_num].submit_cb++;
             return outlen;
         }
 
         qat_chained_ipsec_poll_instance(qctx->inst_num);
+        g_inf_cb_stats[qctx->inst_num].submit_cb++;
         return outlen;
     }
 
@@ -1420,6 +1455,7 @@ int qat_chained_ipsec_ciphers_do_cipher(EVP_CIPHER_CTX *ctx, unsigned char *out,
  end:
     QAT_DEC_IN_FLIGHT_REQS(num_requests_in_flight, tlv);
 
+    g_inf_cb_stats[qctx->inst_num].submit_bh++;
     qat_chained_ipsec_bottom_half(cb_op_done);
 
 
@@ -1472,19 +1508,7 @@ int qat_chained_ipsec_bottom_half(inf_op_done_t *cb_op_done)
 
     g_inf_cb_stats[qctx->inst_num].callback_bh++;
 
-    if (qctx->queue_depth > 0) {
-        qctx->queue_depth--;
-    } else {
-        g_inf_cb_stats[qctx->inst_num].callback_edepth++;
-        if (g_inf_cb_stats[qctx->inst_num].callback_edepth % 100 == 0) {
-            WARN("QUEUE DEPTH negative\n");
-        }
-    }
-
-    if ( qctx->queue_depth > g_inf_cb_stats[qctx->inst_num].queue_max) {
-        g_inf_cb_stats[qctx->inst_num].queue_max = qctx->queue_depth;
-        WARN("QUEUE_MAX %d\n", g_inf_cb_stats[qctx->inst_num].queue_max);
-    }
+    qctx->qop_callback++;
 
     if (cb_op_done->opDone.flag != 1 ||
         cb_op_done->opDone.verifyResult != CPA_TRUE) {
